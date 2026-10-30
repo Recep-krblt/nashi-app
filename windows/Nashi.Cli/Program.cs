@@ -132,7 +132,7 @@ public static class Program
             ["modified"] = info.LastWriteTimeUtc
         };
 
-        if (PhotoCodec.Format(ext.TrimStart('.')) != MagickFormat.Unknown)
+        if (IsImageFormat(ext))
         {
             try
             {
@@ -201,12 +201,12 @@ public static class Program
 
         outputDir ??= Path.GetDirectoryName(Path.GetFullPath(inputs[0])) ?? Environment.CurrentDirectory;
         Directory.CreateDirectory(outputDir);
-        format = format.TrimStart('.').ToLowerInvariant();
+        format = NormalizeFormat(format.TrimStart('.').ToLowerInvariant());
 
         foreach (var file in inputs)
         {
             var fullPath = Path.GetFullPath(file);
-            var inExt = Path.GetExtension(fullPath).TrimStart('.').ToLowerInvariant();
+            var inExt = NormalizeFormat(Path.GetExtension(fullPath).TrimStart('.').ToLowerInvariant());
 
             if (IsImageFormat(inExt) && IsImageFormat(format))
             {
@@ -272,6 +272,24 @@ public static class Program
                     foreach (var code in codes) Console.WriteLine($" - {code}");
                 }
                 return 0;
+
+            case "createpdf":
+                var imageInputs = inputs.Where(f => IsImageFormat(Path.GetExtension(f))).ToList();
+                if (imageInputs.Count > 0)
+                {
+                    Console.WriteLine($"Creating PDF from {imageInputs.Count} image(s)...");
+                    var pdfPath = SafePaths.UniquePath(Path.Combine(outputDir, "Images.pdf"));
+                    using var collection = new MagickImageCollection();
+                    foreach (var img in imageInputs)
+                    {
+                        collection.Add(PhotoCodec.Read(img));
+                    }
+                    collection.Write(pdfPath, MagickFormat.Pdf);
+                    Console.WriteLine($"Created: {pdfPath}");
+                    return 0;
+                }
+                Console.Error.WriteLine("Error: No valid images found to create PDF.");
+                return 1;
 
             case "splitpdf":
                 foreach (var file in inputs)
