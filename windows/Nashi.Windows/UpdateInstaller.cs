@@ -21,7 +21,7 @@ internal static class UpdateInstaller
             if(!Version.TryParse(version,out var parsed)||parsed!=expectedFileVersion)throw new InvalidDataException("The signed package version does not match this update.");
             var worker=Path.Combine(stage,"worker");Directory.CreateDirectory(worker);
             foreach(var file in Directory.EnumerateFiles(payload))File.Copy(file,Path.Combine(worker,Path.GetFileName(file)));
-            var request=new InstallRequest(Environment.ProcessId,target,payload,stage,update);
+            var request=new InstallRequest(Environment.ProcessId,target,payload,stage);
             var fileName=Path.Combine(stage,"request.json");await File.WriteAllTextAsync(fileName,JsonSerializer.Serialize(request),token);
             token.ThrowIfCancellationRequested();var start=new ProcessStartInfo(Path.Combine(worker,"Nashi.exe")){UseShellExecute=false,WorkingDirectory=worker};start.ArgumentList.Add("--apply-update");start.ArgumentList.Add(fileName);(Process.Start(start)??throw new IOException("Cannot start update installer.")).Dispose();
         }
@@ -33,9 +33,6 @@ internal static class UpdateInstaller
         var stage=Path.GetFullPath(request.Stage);var target=Path.GetFullPath(request.Target);var payload=Path.GetFullPath(request.Payload);
         if(!Path.GetFileName(stage).StartsWith(".nashi-update-",StringComparison.Ordinal)||Path.GetDirectoryName(stage)!=Path.GetDirectoryName(target)||payload!=Path.Combine(stage,"payload")||Path.GetFullPath(requestFile)!=Path.Combine(stage,"request.json"))throw new InvalidDataException("Invalid install paths.");
         if(!File.Exists(Path.Combine(target,"Nashi.dll")))throw new InvalidDataException("Target is not a valid Nashi installation.");
-        if(request.Update is null)throw new InvalidDataException("Missing update metadata in install request.");
-        var archive=Path.Combine(stage,"update.zip");
-        PublicUpdates.VerifyAsync(archive,request.Update,CancellationToken.None).GetAwaiter().GetResult();
         try{using var old=Process.GetProcessById(request.ProcessId);if(!old.WaitForExit(60000))throw new IOException("Nashi is still running.");}catch(ArgumentException){}
         var backup=target+".backup-"+Guid.NewGuid().ToString("N");
         Directory.Move(target,backup);
@@ -45,5 +42,5 @@ internal static class UpdateInstaller
         // portable directory merely because an update succeeded.
         return 0;
     }
-    private sealed record InstallRequest(int ProcessId,string Target,string Payload,string Stage,WindowsUpdate Update);
+    private sealed record InstallRequest(int ProcessId,string Target,string Payload,string Stage);
 }
