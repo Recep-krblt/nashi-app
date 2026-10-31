@@ -33,6 +33,7 @@ internal static class UpdateInstaller
         var stage=Path.GetFullPath(request.Stage);var target=Path.GetFullPath(request.Target);var payload=Path.GetFullPath(request.Payload);
         if(!Path.GetFileName(stage).StartsWith(".nashi-update-",StringComparison.Ordinal)||Path.GetDirectoryName(stage)!=Path.GetDirectoryName(target)||payload!=Path.Combine(stage,"payload")||Path.GetFullPath(requestFile)!=Path.Combine(stage,"request.json"))throw new InvalidDataException("Invalid install paths.");
         if(!File.Exists(Path.Combine(target,"Nashi.dll")))throw new InvalidDataException("Target is not a valid Nashi installation.");
+        if(request.Update is null)throw new InvalidDataException("Missing update metadata in install request.");
         var archive=Path.Combine(stage,"update.zip");
         PublicUpdates.VerifyAsync(archive,request.Update,CancellationToken.None).GetAwaiter().GetResult();
         try{using var old=Process.GetProcessById(request.ProcessId);if(!old.WaitForExit(60000))throw new IOException("Nashi is still running.");}catch(ArgumentException){}
