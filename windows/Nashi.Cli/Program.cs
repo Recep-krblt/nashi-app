@@ -37,6 +37,7 @@ public static class Program
                 "inspect" => args.Length < 2 ? MissingArgument("inspect <file>") : await RunInspectAsync(args[1]),
                 "dependencies" => RunDependencies(),
                 "convert" => args.Length < 3 ? MissingArgument("convert <format> <file...> [--output <dir>]") : await RunConvertAsync(args[1], args[2..]),
+                "resize" => args.Length < 3 ? MissingArgument("resize <dimensions> <file...> [--fit crop|contain|stretch] [--quality 100] [--output <dir>]") : await RunResizeAsync(args[1], args[2..]),
                 "tool" => args.Length < 3 ? MissingArgument("tool <tool-id> <file...> [--output <dir>]") : await RunToolAsync(args[1], args[2..]),
                 _ => UnknownCommand(command)
             };
@@ -57,6 +58,7 @@ public static class Program
         Console.WriteLine("Parity interface for Nashi.Core\n");
         Console.WriteLine("Usage:");
         Console.WriteLine("  nashi convert <format> <file...> [--output <dir>]");
+        Console.WriteLine("  nashi resize <dimensions> <file...> [--fit crop|contain|stretch] [--quality 100] [--output <dir>]");
         Console.WriteLine("  nashi tool <tool-id> <file...> [--output <dir>]");
         Console.WriteLine("  nashi inspect <file>");
         Console.WriteLine("  nashi catalog");
@@ -64,6 +66,8 @@ public static class Program
         Console.WriteLine("Examples:");
         Console.WriteLine("  nashi convert pdf document.docx");
         Console.WriteLine("  nashi convert webp image.png");
+        Console.WriteLine("  nashi resize 1900x1200 photo.jpg --fit crop");
+        Console.WriteLine("  nashi resize 1920x1080 wallpaper.png --fit contain --quality 100");
         Console.WriteLine("  nashi tool splitPDF doc.pdf");
         Console.WriteLine("  nashi tool mergePDF page1.pdf page2.pdf");
         Console.WriteLine("  nashi inspect photo.jpg");
@@ -211,7 +215,7 @@ public static class Program
             if (IsImageFormat(inExt) && IsImageFormat(format))
             {
                 var destName = Path.GetFileNameWithoutExtension(fullPath) + "." + format;
-                var destPath = SafePaths.UniquePath(Path.Combine(outputDir, destName));
+                var destPath = SafePaths.Unique(outputDir, destName);
                 using var image = PhotoCodec.Read(fullPath);
                 var png = image.ToByteArray(MagickFormat.Png);
                 PhotoCodec.EncodePng(png, destPath, format, token: CancellationToken.None);
@@ -243,6 +247,204 @@ public static class Program
         Console.WriteLine("Done.");
         return 0;
     }
+
+    /// <summary>
+    /// Resizes images with studio-fidelity Lanczos resampling and configurable fit modes (crop, contain, stretch).
+    /// </summary>
+    /// <param name="dimensionsArg">Dimension specification: e.g. 1900x1200, 1900x, x1200, or 50%.</param>
+    /// <param name="filesAndOptions">Input image paths and flags (--fit, --quality, --format, --output).</param>
+    /// <returns>Process exit code (0 on success).</returns>
+    private static async Task<int> RunResizeAsync(string dimensionsArg, string[] filesAndOptions)
+    {
+        var (inputs, outputDir, fit, quality, formatOverride) = ParseResizeArguments(filesAndOptions);
+        if (inputs.Count == 0)
+        {
+            Console.Error.WriteLine("Error: No valid input files specified.");
+            return 64;
+        }
+
+        outputDir ??= Path.GetDirectoryName(Path.GetFullPath(inputs[0])) ?? Environment.CurrentDirectory;
+        Directory.CreateDirectory(outputDir);
+
+        var (reqW, reqH, scalePercent) = ParseDimensions(dimensionsArg);
+        if (reqW is null && reqH is null && scalePercent is null)
+        {
+            Console.Error.WriteLine($"Error: Invalid dimensions '{dimensionsArg}'. Expected format: WxH (e.g. 1900x1200), Wx (e.g. 1900x), xH (e.g. x1200), or P% (e.g. 50%).");
+            return 64;
+        }
+
+        foreach (var file in inputs)
+        {
+            var fullPath = Path.GetFullPath(file);
+            var inExt = NormalizeFormat(Path.GetExtension(fullPath));
+            if (!IsImageFormat(inExt))
+            {
+                Console.Error.WriteLine($"Skipping non-image file: {Path.GetFileName(file)}");
+                continue;
+            }
+
+            var targetFormat = formatOverride ?? inExt;
+            targetFormat = NormalizeFormat(targetFormat);
+
+            using var image = new MagickImage(fullPath);
+            int origW = (int)image.Width;
+            int origH = (int)image.Height;
+
+            int targetW, targetH;
+            if (scalePercent is not null)
+            {
+                double factor = scalePercent.Value / 100.0;
+                targetW = Math.Max(1, (int)Math.Round(origW * factor));
+                targetH = Math.Max(1, (int)Math.Round(origH * factor));
+            }
+            else if (reqW is not null && reqH is not null)
+            {
+                targetW = reqW.Value;
+                targetH = reqH.Value;
+            }
+            else if (reqW is not null)
+            {
+                targetW = reqW.Value;
+                targetH = Math.Max(1, (int)Math.Round(origH * ((double)targetW / origW)));
+            }
+            else
+            {
+                targetH = reqH!.Value;
+                targetW = Math.Max(1, (int)Math.Round(origW * ((double)targetH / origH)));
+            }
+
+            if (targetW < 1 || targetH < 1 || targetW > 30000 || targetH > 30000 || (long)targetW * targetH > 100_000_000)
+            {
+                Console.Error.WriteLine($"Error: Target dimensions {targetW}x{targetH} exceed limits (1 to 30,000 px, 100 MP limit).");
+                return 1;
+            }
+
+            image.FilterType = FilterType.Lanczos;
+
+            if (fit == "crop" && reqW is not null && reqH is not null)
+            {
+                double scale = Math.Max((double)targetW / origW, (double)targetH / origH);
+                int scaledW = Math.Max(targetW, (int)Math.Round(origW * scale));
+                int scaledH = Math.Max(targetH, (int)Math.Round(origH * scale));
+
+                image.Resize((uint)scaledW, (uint)scaledH);
+
+                int cropX = Math.Max(0, (scaledW - targetW) / 2);
+                int cropY = Math.Max(0, (scaledH - targetH) / 2);
+
+                image.Crop(new MagickGeometry(cropX, cropY, (uint)targetW, (uint)targetH));
+                image.ResetPage();
+            }
+            else if (fit == "stretch")
+            {
+                image.Resize(new MagickGeometry((uint)targetW, (uint)targetH) { IgnoreAspectRatio = true });
+            }
+            else
+            {
+                double scale = Math.Min((double)targetW / origW, (double)targetH / origH);
+                int scaledW = Math.Max(1, (int)Math.Round(origW * scale));
+                int scaledH = Math.Max(1, (int)Math.Round(origH * scale));
+                image.Resize((uint)scaledW, (uint)scaledH);
+                targetW = scaledW;
+                targetH = scaledH;
+            }
+
+            image.Quality = (uint)Math.Clamp(quality, 1, 100);
+
+            if (targetFormat is "jpg" or "jpeg")
+            {
+                image.Format = MagickFormat.Jpeg;
+                if (quality >= 95)
+                {
+                    image.Settings.SetDefine(MagickFormat.Jpeg, "sampling-factor", "4:4:4");
+                }
+            }
+            else if (targetFormat == "png")
+            {
+                image.Format = MagickFormat.Png;
+            }
+            else if (targetFormat == "webp")
+            {
+                image.Format = MagickFormat.WebP;
+                if (quality >= 100) image.Settings.SetDefine(MagickFormat.WebP, "lossless", "true");
+            }
+
+            var baseName = Path.GetFileNameWithoutExtension(fullPath);
+            var destName = $"{baseName}-{targetW}x{targetH}.{targetFormat}";
+            var destPath = SafePaths.Unique(outputDir, destName);
+
+            image.Write(destPath);
+            Console.WriteLine($"Resized: {destPath} ({image.Width}x{image.Height}, quality {quality}, fit: {fit})");
+        }
+
+        Console.WriteLine("Done.");
+        return 0;
+    }
+
+    private static (int? Width, int? Height, double? Percent) ParseDimensions(string spec)
+    {
+        spec = spec.Trim().ToLowerInvariant();
+        if (spec.EndsWith('%') && double.TryParse(spec[..^1], out var pct) && pct > 0)
+        {
+            return (null, null, pct);
+        }
+
+        var parts = spec.Split('x');
+        if (parts.Length == 2)
+        {
+            int? w = int.TryParse(parts[0], out var pw) && pw > 0 ? pw : null;
+            int? h = int.TryParse(parts[1], out var ph) && ph > 0 ? ph : null;
+            if (w is not null || h is not null) return (w, h, null);
+        }
+        else if (parts.Length == 1 && int.TryParse(parts[0], out var singleW) && singleW > 0)
+        {
+            return (singleW, null, null);
+        }
+
+        return (null, null, null);
+    }
+
+    private static (List<string> Inputs, string? OutputDir, string Fit, int Quality, string? Format) ParseResizeArguments(string[] args)
+    {
+        var inputs = new List<string>();
+        string? outputDir = null;
+        string fit = "crop";
+        int quality = 100;
+        string? format = null;
+
+        for (int i = 0; i < args.Length; i++)
+        {
+            var arg = args[i];
+            if (arg is "-o" or "--output" or "--outdir" && i + 1 < args.Length)
+            {
+                outputDir = args[++i];
+            }
+            else if (arg is "--fit" && i + 1 < args.Length)
+            {
+                fit = args[++i].ToLowerInvariant() switch
+                {
+                    "contain" or "fit" => "contain",
+                    "stretch" or "fill" or "exact" => "stretch",
+                    _ => "crop"
+                };
+            }
+            else if (arg is "-q" or "--quality" && i + 1 < args.Length && int.TryParse(args[++i], out var q))
+            {
+                quality = Math.Clamp(q, 1, 100);
+            }
+            else if (arg is "-f" or "--format" && i + 1 < args.Length)
+            {
+                format = args[++i];
+            }
+            else if (File.Exists(arg) || Directory.Exists(arg))
+            {
+                inputs.Add(arg);
+            }
+        }
+
+        return (inputs, outputDir, fit, quality, format);
+    }
+
 
     /// <summary>
     /// Runs a standalone tool such as PDF split/merge or archive extraction.
@@ -278,7 +480,7 @@ public static class Program
                 if (imageInputs.Count > 0)
                 {
                     Console.WriteLine($"Creating PDF from {imageInputs.Count} image(s)...");
-                    var pdfPath = SafePaths.UniquePath(Path.Combine(outputDir, "Images.pdf"));
+                    var pdfPath = SafePaths.Unique(outputDir, "Images.pdf");
                     using var collection = new MagickImageCollection();
                     foreach (var img in imageInputs)
                     {
@@ -328,7 +530,18 @@ public static class Program
     /// </summary>
     /// <param name="ext">Extension without leading dot.</param>
     /// <returns>True if recognized as an image format.</returns>
-    private static bool IsImageFormat(string ext) => ext is "jpg" or "jpeg" or "png" or "webp" or "gif" or "avif" or "heic" or "bmp" or "tiff" or "tif";
+    private static string NormalizeFormat(string ext) => ext.TrimStart('.').ToLowerInvariant() switch
+    {
+        "jpeg" => "jpg",
+        "tif" => "tiff",
+        "heif" => "heic",
+        "aif" => "aiff",
+        "markdown" => "md",
+        "htm" => "html",
+        var other => other
+    };
+
+    private static bool IsImageFormat(string ext) => NormalizeFormat(ext) is "jpg" or "png" or "webp" or "gif" or "avif" or "heic" or "bmp" or "tiff";
 
     /// <summary>
     /// Reads and decodes QR codes from an image file using ZXing luminance source.
